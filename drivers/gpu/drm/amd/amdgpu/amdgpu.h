@@ -425,6 +425,8 @@ int amdgpu_fence_driver_start_ring(struct amdgpu_ring *ring,
 				   unsigned irq_type);
 int amdgpu_fence_emit(struct amdgpu_ring *ring, void *owner,
 		      struct amdgpu_fence **fence);
+int amdgpu_fence_recreate(struct amdgpu_ring *ring, void *owner,
+			  uint64_t seq, struct amdgpu_fence **fence);
 void amdgpu_fence_process(struct amdgpu_ring *ring);
 int amdgpu_fence_wait_next(struct amdgpu_ring *ring);
 int amdgpu_fence_wait_empty(struct amdgpu_ring *ring);
@@ -435,9 +437,6 @@ int amdgpu_fence_wait(struct amdgpu_fence *fence, bool interruptible);
 int amdgpu_fence_wait_any(struct amdgpu_device *adev,
 			  struct amdgpu_fence **fences,
 			  bool intr);
-long amdgpu_fence_wait_seq_timeout(struct amdgpu_device *adev,
-				   u64 *target_seq, bool intr,
-				   long timeout);
 struct amdgpu_fence *amdgpu_fence_ref(struct amdgpu_fence *fence);
 void amdgpu_fence_unref(struct amdgpu_fence **fence);
 
@@ -1131,6 +1130,9 @@ struct amdgpu_gfx {
 	uint32_t			me_feature_version;
 	uint32_t			ce_feature_version;
 	uint32_t			pfp_feature_version;
+	uint32_t			rlc_feature_version;
+	uint32_t			mec_feature_version;
+	uint32_t			mec2_feature_version;
 	struct amdgpu_ring		gfx_ring[AMDGPU_MAX_GFX_RINGS];
 	unsigned			num_gfx_rings;
 	struct amdgpu_ring		compute_ring[AMDGPU_MAX_COMPUTE_RINGS];
@@ -1615,6 +1617,9 @@ struct amdgpu_uvd {
 #define AMDGPU_MAX_VCE_HANDLES	16
 #define AMDGPU_VCE_FIRMWARE_OFFSET 256
 
+#define AMDGPU_VCE_HARVEST_VCE0 (1 << 0)
+#define AMDGPU_VCE_HARVEST_VCE1 (1 << 1)
+
 struct amdgpu_vce {
 	struct amdgpu_bo	*vcpu_bo;
 	uint64_t		gpu_addr;
@@ -1622,10 +1627,12 @@ struct amdgpu_vce {
 	unsigned		fb_version;
 	atomic_t		handles[AMDGPU_MAX_VCE_HANDLES];
 	struct drm_file		*filp[AMDGPU_MAX_VCE_HANDLES];
+	uint32_t		img_size[AMDGPU_MAX_VCE_HANDLES];
 	struct delayed_work	idle_work;
 	const struct firmware	*fw;	/* VCE firmware */
 	struct amdgpu_ring	ring[AMDGPU_MAX_VCE_RINGS];
 	struct amdgpu_irq_src	irq;
+	unsigned		harvest_config;
 };
 
 /*
@@ -1635,6 +1642,7 @@ struct amdgpu_sdma {
 	/* SDMA firmware */
 	const struct firmware	*fw;
 	uint32_t		fw_version;
+	uint32_t		feature_version;
 
 	struct amdgpu_ring	ring;
 };
@@ -1862,6 +1870,12 @@ typedef void (*amdgpu_wreg_t)(struct amdgpu_device*, uint32_t, uint32_t);
 typedef uint32_t (*amdgpu_block_rreg_t)(struct amdgpu_device*, uint32_t, uint32_t);
 typedef void (*amdgpu_block_wreg_t)(struct amdgpu_device*, uint32_t, uint32_t, uint32_t);
 
+struct amdgpu_ip_block_status {
+	bool valid;
+	bool sw;
+	bool hw;
+};
+
 struct amdgpu_device {
 	struct device			*dev;
 	struct drm_device		*ddev;
@@ -2004,7 +2018,7 @@ struct amdgpu_device {
 
 	const struct amdgpu_ip_block_version *ip_blocks;
 	int				num_ip_blocks;
-	bool				*ip_block_enabled;
+	struct amdgpu_ip_block_status	*ip_block_status;
 	struct mutex	mn_lock;
 	DECLARE_HASHTABLE(mn_hash, 7);
 

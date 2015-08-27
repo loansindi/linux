@@ -587,6 +587,7 @@ static int gfx_v8_0_init_microcode(struct amdgpu_device *adev)
 	int err;
 	struct amdgpu_firmware_info *info = NULL;
 	const struct common_firmware_header *header = NULL;
+	const struct gfx_firmware_header_v1_0 *cp_hdr;
 
 	DRM_DEBUG("\n");
 
@@ -611,6 +612,9 @@ static int gfx_v8_0_init_microcode(struct amdgpu_device *adev)
 	err = amdgpu_ucode_validate(adev->gfx.pfp_fw);
 	if (err)
 		goto out;
+	cp_hdr = (const struct gfx_firmware_header_v1_0 *)adev->gfx.pfp_fw->data;
+	adev->gfx.pfp_fw_version = le32_to_cpu(cp_hdr->header.ucode_version);
+	adev->gfx.pfp_feature_version = le32_to_cpu(cp_hdr->ucode_feature_version);
 
 	snprintf(fw_name, sizeof(fw_name), "amdgpu/%s_me.bin", chip_name);
 	err = request_firmware(&adev->gfx.me_fw, fw_name, adev->dev);
@@ -619,6 +623,9 @@ static int gfx_v8_0_init_microcode(struct amdgpu_device *adev)
 	err = amdgpu_ucode_validate(adev->gfx.me_fw);
 	if (err)
 		goto out;
+	cp_hdr = (const struct gfx_firmware_header_v1_0 *)adev->gfx.me_fw->data;
+	adev->gfx.me_fw_version = le32_to_cpu(cp_hdr->header.ucode_version);
+	adev->gfx.me_feature_version = le32_to_cpu(cp_hdr->ucode_feature_version);
 
 	snprintf(fw_name, sizeof(fw_name), "amdgpu/%s_ce.bin", chip_name);
 	err = request_firmware(&adev->gfx.ce_fw, fw_name, adev->dev);
@@ -627,12 +634,18 @@ static int gfx_v8_0_init_microcode(struct amdgpu_device *adev)
 	err = amdgpu_ucode_validate(adev->gfx.ce_fw);
 	if (err)
 		goto out;
+	cp_hdr = (const struct gfx_firmware_header_v1_0 *)adev->gfx.ce_fw->data;
+	adev->gfx.ce_fw_version = le32_to_cpu(cp_hdr->header.ucode_version);
+	adev->gfx.ce_feature_version = le32_to_cpu(cp_hdr->ucode_feature_version);
 
 	snprintf(fw_name, sizeof(fw_name), "amdgpu/%s_rlc.bin", chip_name);
 	err = request_firmware(&adev->gfx.rlc_fw, fw_name, adev->dev);
 	if (err)
 		goto out;
 	err = amdgpu_ucode_validate(adev->gfx.rlc_fw);
+	cp_hdr = (const struct gfx_firmware_header_v1_0 *)adev->gfx.rlc_fw->data;
+	adev->gfx.rlc_fw_version = le32_to_cpu(cp_hdr->header.ucode_version);
+	adev->gfx.rlc_feature_version = le32_to_cpu(cp_hdr->ucode_feature_version);
 
 	snprintf(fw_name, sizeof(fw_name), "amdgpu/%s_mec.bin", chip_name);
 	err = request_firmware(&adev->gfx.mec_fw, fw_name, adev->dev);
@@ -641,6 +654,9 @@ static int gfx_v8_0_init_microcode(struct amdgpu_device *adev)
 	err = amdgpu_ucode_validate(adev->gfx.mec_fw);
 	if (err)
 		goto out;
+	cp_hdr = (const struct gfx_firmware_header_v1_0 *)adev->gfx.mec_fw->data;
+	adev->gfx.mec_fw_version = le32_to_cpu(cp_hdr->header.ucode_version);
+	adev->gfx.mec_feature_version = le32_to_cpu(cp_hdr->ucode_feature_version);
 
 	snprintf(fw_name, sizeof(fw_name), "amdgpu/%s_mec2.bin", chip_name);
 	err = request_firmware(&adev->gfx.mec2_fw, fw_name, adev->dev);
@@ -648,6 +664,12 @@ static int gfx_v8_0_init_microcode(struct amdgpu_device *adev)
 		err = amdgpu_ucode_validate(adev->gfx.mec2_fw);
 		if (err)
 			goto out;
+		cp_hdr = (const struct gfx_firmware_header_v1_0 *)
+						adev->gfx.mec2_fw->data;
+		adev->gfx.mec2_fw_version = le32_to_cpu(
+						cp_hdr->header.ucode_version);
+		adev->gfx.mec2_feature_version = le32_to_cpu(
+						cp_hdr->ucode_feature_version);
 	} else {
 		err = 0;
 		adev->gfx.mec2_fw = NULL;
@@ -1813,10 +1835,7 @@ static u32 gfx_v8_0_get_rb_disabled(struct amdgpu_device *adev,
 	u32 data, mask;
 
 	data = RREG32(mmCC_RB_BACKEND_DISABLE);
-	if (data & 1)
-		data &= CC_RB_BACKEND_DISABLE__BACKEND_DISABLE_MASK;
-	else
-		data = 0;
+	data &= CC_RB_BACKEND_DISABLE__BACKEND_DISABLE_MASK;
 
 	data |= RREG32(mmGC_USER_RB_BACKEND_DISABLE);
 
@@ -1894,6 +1913,51 @@ static void gfx_v8_0_setup_rb(struct amdgpu_device *adev,
 	mutex_unlock(&adev->grbm_idx_mutex);
 }
 
+/**
+ * gmc_v8_0_init_compute_vmid - gart enable
+ *
+ * @rdev: amdgpu_device pointer
+ *
+ * Initialize compute vmid sh_mem registers
+ *
+ */
+#define DEFAULT_SH_MEM_BASES	(0x6000)
+#define FIRST_COMPUTE_VMID	(8)
+#define LAST_COMPUTE_VMID	(16)
+static void gmc_v8_0_init_compute_vmid(struct amdgpu_device *adev)
+{
+	int i;
+	uint32_t sh_mem_config;
+	uint32_t sh_mem_bases;
+
+	/*
+	 * Configure apertures:
+	 * LDS:         0x60000000'00000000 - 0x60000001'00000000 (4GB)
+	 * Scratch:     0x60000001'00000000 - 0x60000002'00000000 (4GB)
+	 * GPUVM:       0x60010000'00000000 - 0x60020000'00000000 (1TB)
+	 */
+	sh_mem_bases = DEFAULT_SH_MEM_BASES | (DEFAULT_SH_MEM_BASES << 16);
+
+	sh_mem_config = SH_MEM_ADDRESS_MODE_HSA64 <<
+			SH_MEM_CONFIG__ADDRESS_MODE__SHIFT |
+			SH_MEM_ALIGNMENT_MODE_UNALIGNED <<
+			SH_MEM_CONFIG__ALIGNMENT_MODE__SHIFT |
+			MTYPE_CC << SH_MEM_CONFIG__DEFAULT_MTYPE__SHIFT |
+			SH_MEM_CONFIG__PRIVATE_ATC_MASK;
+
+	mutex_lock(&adev->srbm_mutex);
+	for (i = FIRST_COMPUTE_VMID; i < LAST_COMPUTE_VMID; i++) {
+		vi_srbm_select(adev, 0, 0, 0, i);
+		/* CP and shaders */
+		WREG32(mmSH_MEM_CONFIG, sh_mem_config);
+		WREG32(mmSH_MEM_APE1_BASE, 1);
+		WREG32(mmSH_MEM_APE1_LIMIT, 0);
+		WREG32(mmSH_MEM_BASES, sh_mem_bases);
+	}
+	vi_srbm_select(adev, 0, 0, 0, 0);
+	mutex_unlock(&adev->srbm_mutex);
+}
+
 static void gfx_v8_0_gpu_init(struct amdgpu_device *adev)
 {
 	u32 gb_addr_config;
@@ -1941,6 +2005,7 @@ static void gfx_v8_0_gpu_init(struct amdgpu_device *adev)
 		adev->gfx.config.max_shader_engines = 1;
 		adev->gfx.config.max_tile_pipes = 2;
 		adev->gfx.config.max_sh_per_se = 1;
+		adev->gfx.config.max_backends_per_se = 2;
 
 		switch (adev->pdev->revision) {
 		case 0xc4:
@@ -1949,7 +2014,6 @@ static void gfx_v8_0_gpu_init(struct amdgpu_device *adev)
 		case 0xcc:
 			/* B10 */
 			adev->gfx.config.max_cu_per_sh = 8;
-			adev->gfx.config.max_backends_per_se = 2;
 			break;
 		case 0xc5:
 		case 0x81:
@@ -1958,14 +2022,12 @@ static void gfx_v8_0_gpu_init(struct amdgpu_device *adev)
 		case 0xcd:
 			/* B8 */
 			adev->gfx.config.max_cu_per_sh = 6;
-			adev->gfx.config.max_backends_per_se = 2;
 			break;
 		case 0xc6:
 		case 0xca:
 		case 0xce:
 			/* B6 */
 			adev->gfx.config.max_cu_per_sh = 6;
-			adev->gfx.config.max_backends_per_se = 2;
 			break;
 		case 0xc7:
 		case 0x87:
@@ -1973,7 +2035,6 @@ static void gfx_v8_0_gpu_init(struct amdgpu_device *adev)
 		default:
 			/* B4 */
 			adev->gfx.config.max_cu_per_sh = 4;
-			adev->gfx.config.max_backends_per_se = 1;
 			break;
 		}
 
@@ -2113,6 +2174,8 @@ static void gfx_v8_0_gpu_init(struct amdgpu_device *adev)
 	vi_srbm_select(adev, 0, 0, 0, 0);
 	mutex_unlock(&adev->srbm_mutex);
 
+	gmc_v8_0_init_compute_vmid(adev);
+
 	mutex_lock(&adev->grbm_idx_mutex);
 	/*
 	 * making sure that the following register writes will be broadcasted
@@ -2231,7 +2294,6 @@ static int gfx_v8_0_rlc_load_microcode(struct amdgpu_device *adev)
 
 	hdr = (const struct rlc_firmware_header_v2_0 *)adev->gfx.rlc_fw->data;
 	amdgpu_ucode_print_rlc_hdr(&hdr->header);
-	adev->gfx.rlc_fw_version = le32_to_cpu(hdr->header.ucode_version);
 
 	fw_data = (const __le32 *)(adev->gfx.rlc_fw->data +
 			   le32_to_cpu(hdr->header.ucode_array_offset_bytes));
@@ -2317,12 +2379,6 @@ static int gfx_v8_0_cp_gfx_load_microcode(struct amdgpu_device *adev)
 	amdgpu_ucode_print_gfx_hdr(&pfp_hdr->header);
 	amdgpu_ucode_print_gfx_hdr(&ce_hdr->header);
 	amdgpu_ucode_print_gfx_hdr(&me_hdr->header);
-	adev->gfx.pfp_fw_version = le32_to_cpu(pfp_hdr->header.ucode_version);
-	adev->gfx.ce_fw_version = le32_to_cpu(ce_hdr->header.ucode_version);
-	adev->gfx.me_fw_version = le32_to_cpu(me_hdr->header.ucode_version);
-	adev->gfx.me_feature_version = le32_to_cpu(me_hdr->ucode_feature_version);
-	adev->gfx.ce_feature_version = le32_to_cpu(ce_hdr->ucode_feature_version);
-	adev->gfx.pfp_feature_version = le32_to_cpu(pfp_hdr->ucode_feature_version);
 
 	gfx_v8_0_cp_gfx_enable(adev, false);
 
@@ -2578,7 +2634,6 @@ static int gfx_v8_0_cp_compute_load_microcode(struct amdgpu_device *adev)
 
 	mec_hdr = (const struct gfx_firmware_header_v1_0 *)adev->gfx.mec_fw->data;
 	amdgpu_ucode_print_gfx_hdr(&mec_hdr->header);
-	adev->gfx.mec_fw_version = le32_to_cpu(mec_hdr->header.ucode_version);
 
 	fw_data = (const __le32 *)
 		(adev->gfx.mec_fw->data +
@@ -2597,7 +2652,6 @@ static int gfx_v8_0_cp_compute_load_microcode(struct amdgpu_device *adev)
 
 		mec2_hdr = (const struct gfx_firmware_header_v1_0 *)adev->gfx.mec2_fw->data;
 		amdgpu_ucode_print_gfx_hdr(&mec2_hdr->header);
-		adev->gfx.mec2_fw_version = le32_to_cpu(mec2_hdr->header.ucode_version);
 
 		fw_data = (const __le32 *)
 			(adev->gfx.mec2_fw->data +
@@ -3096,6 +3150,12 @@ static int gfx_v8_0_cp_compute_resume(struct amdgpu_device *adev)
 		}
 		WREG32(mmCP_HQD_PQ_DOORBELL_CONTROL,
 		       mqd->cp_hqd_pq_doorbell_control);
+
+		/* reset read and write pointers, similar to CP_RB0_WPTR/_RPTR */
+		ring->wptr = 0;
+		mqd->cp_hqd_pq_wptr = ring->wptr;
+		WREG32(mmCP_HQD_PQ_WPTR, mqd->cp_hqd_pq_wptr);
+		mqd->cp_hqd_pq_rptr = RREG32(mmCP_HQD_PQ_RPTR);
 
 		/* set the vmid for the queue */
 		mqd->cp_hqd_vmid = 0;
@@ -3703,7 +3763,7 @@ static void gfx_v8_0_ring_emit_hdp_flush(struct amdgpu_ring *ring)
 	amdgpu_ring_write(ring, 0x20); /* poll interval */
 }
 
-static void gfx_v8_0_ring_emit_ib(struct amdgpu_ring *ring,
+static void gfx_v8_0_ring_emit_ib_gfx(struct amdgpu_ring *ring,
 				  struct amdgpu_ib *ib)
 {
 	bool need_ctx_switch = ring->current_ctx != ib->ctx;
@@ -3711,15 +3771,10 @@ static void gfx_v8_0_ring_emit_ib(struct amdgpu_ring *ring,
 	u32 next_rptr = ring->wptr + 5;
 
 	/* drop the CE preamble IB for the same context */
-	if ((ring->type == AMDGPU_RING_TYPE_GFX) &&
-	    (ib->flags & AMDGPU_IB_FLAG_PREAMBLE) &&
-	    !need_ctx_switch)
+	if ((ib->flags & AMDGPU_IB_FLAG_PREAMBLE) && !need_ctx_switch)
 		return;
 
-	if (ring->type == AMDGPU_RING_TYPE_COMPUTE)
-		control |= INDIRECT_BUFFER_VALID;
-
-	if (need_ctx_switch && ring->type == AMDGPU_RING_TYPE_GFX)
+	if (need_ctx_switch)
 		next_rptr += 2;
 
 	next_rptr += 4;
@@ -3730,7 +3785,7 @@ static void gfx_v8_0_ring_emit_ib(struct amdgpu_ring *ring,
 	amdgpu_ring_write(ring, next_rptr);
 
 	/* insert SWITCH_BUFFER packet before first IB in the ring frame */
-	if (need_ctx_switch && ring->type == AMDGPU_RING_TYPE_GFX) {
+	if (need_ctx_switch) {
 		amdgpu_ring_write(ring, PACKET3(PACKET3_SWITCH_BUFFER, 0));
 		amdgpu_ring_write(ring, 0);
 	}
@@ -3749,6 +3804,36 @@ static void gfx_v8_0_ring_emit_ib(struct amdgpu_ring *ring,
 			  (2 << 0) |
 #endif
 			  (ib->gpu_addr & 0xFFFFFFFC));
+	amdgpu_ring_write(ring, upper_32_bits(ib->gpu_addr) & 0xFFFF);
+	amdgpu_ring_write(ring, control);
+}
+
+static void gfx_v8_0_ring_emit_ib_compute(struct amdgpu_ring *ring,
+				  struct amdgpu_ib *ib)
+{
+	u32 header, control = 0;
+	u32 next_rptr = ring->wptr + 5;
+
+	control |= INDIRECT_BUFFER_VALID;
+
+	next_rptr += 4;
+	amdgpu_ring_write(ring, PACKET3(PACKET3_WRITE_DATA, 3));
+	amdgpu_ring_write(ring, WRITE_DATA_DST_SEL(5) | WR_CONFIRM);
+	amdgpu_ring_write(ring, ring->next_rptr_gpu_addr & 0xfffffffc);
+	amdgpu_ring_write(ring, upper_32_bits(ring->next_rptr_gpu_addr) & 0xffffffff);
+	amdgpu_ring_write(ring, next_rptr);
+
+	header = PACKET3(PACKET3_INDIRECT_BUFFER, 2);
+
+	control |= ib->length_dw |
+			   (ib->vm ? (ib->vm->ids[ring->idx].id << 24) : 0);
+
+	amdgpu_ring_write(ring, header);
+	amdgpu_ring_write(ring,
+#ifdef __BIG_ENDIAN
+					  (2 << 0) |
+#endif
+					  (ib->gpu_addr & 0xFFFFFFFC));
 	amdgpu_ring_write(ring, upper_32_bits(ib->gpu_addr) & 0xFFFF);
 	amdgpu_ring_write(ring, control);
 }
@@ -4174,7 +4259,7 @@ static const struct amdgpu_ring_funcs gfx_v8_0_ring_funcs_gfx = {
 	.get_wptr = gfx_v8_0_ring_get_wptr_gfx,
 	.set_wptr = gfx_v8_0_ring_set_wptr_gfx,
 	.parse_cs = NULL,
-	.emit_ib = gfx_v8_0_ring_emit_ib,
+	.emit_ib = gfx_v8_0_ring_emit_ib_gfx,
 	.emit_fence = gfx_v8_0_ring_emit_fence_gfx,
 	.emit_semaphore = gfx_v8_0_ring_emit_semaphore,
 	.emit_vm_flush = gfx_v8_0_ring_emit_vm_flush,
@@ -4190,7 +4275,7 @@ static const struct amdgpu_ring_funcs gfx_v8_0_ring_funcs_compute = {
 	.get_wptr = gfx_v8_0_ring_get_wptr_compute,
 	.set_wptr = gfx_v8_0_ring_set_wptr_compute,
 	.parse_cs = NULL,
-	.emit_ib = gfx_v8_0_ring_emit_ib,
+	.emit_ib = gfx_v8_0_ring_emit_ib_compute,
 	.emit_fence = gfx_v8_0_ring_emit_fence_compute,
 	.emit_semaphore = gfx_v8_0_ring_emit_semaphore,
 	.emit_vm_flush = gfx_v8_0_ring_emit_vm_flush,

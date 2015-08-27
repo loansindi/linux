@@ -99,7 +99,7 @@ static int null_set_queue_mode(const char *str, const struct kernel_param *kp)
 	return null_param_store_val(str, &queue_mode, NULL_Q_BIO, NULL_Q_MQ);
 }
 
-static struct kernel_param_ops null_queue_mode_param_ops = {
+static const struct kernel_param_ops null_queue_mode_param_ops = {
 	.set	= null_set_queue_mode,
 	.get	= param_get_int,
 };
@@ -127,7 +127,7 @@ static int null_set_irqmode(const char *str, const struct kernel_param *kp)
 					NULL_IRQ_TIMER);
 }
 
-static struct kernel_param_ops null_irqmode_param_ops = {
+static const struct kernel_param_ops null_irqmode_param_ops = {
 	.set	= null_set_irqmode,
 	.get	= param_get_int,
 };
@@ -240,19 +240,19 @@ static enum hrtimer_restart null_cmd_timer_expired(struct hrtimer *timer)
 	while ((entry = llist_del_all(&cq->list)) != NULL) {
 		entry = llist_reverse_order(entry);
 		do {
+			struct request_queue *q = NULL;
+
 			cmd = container_of(entry, struct nullb_cmd, ll_list);
 			entry = entry->next;
+			if (cmd->rq)
+				q = cmd->rq->q;
 			end_cmd(cmd);
 
-			if (cmd->rq) {
-				struct request_queue *q = cmd->rq->q;
-
-				if (!q->mq_ops && blk_queue_stopped(q)) {
-					spin_lock(q->queue_lock);
-					if (blk_queue_stopped(q))
-						blk_start_queue(q);
-					spin_unlock(q->queue_lock);
-				}
+			if (q && !q->mq_ops && blk_queue_stopped(q)) {
+				spin_lock(q->queue_lock);
+				if (blk_queue_stopped(q))
+					blk_start_queue(q);
+				spin_unlock(q->queue_lock);
 			}
 		} while (entry);
 	}

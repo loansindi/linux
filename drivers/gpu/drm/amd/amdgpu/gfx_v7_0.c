@@ -2010,6 +2010,46 @@ static void gfx_v7_0_setup_rb(struct amdgpu_device *adev,
 }
 
 /**
+ * gmc_v7_0_init_compute_vmid - gart enable
+ *
+ * @rdev: amdgpu_device pointer
+ *
+ * Initialize compute vmid sh_mem registers
+ *
+ */
+#define DEFAULT_SH_MEM_BASES	(0x6000)
+#define FIRST_COMPUTE_VMID	(8)
+#define LAST_COMPUTE_VMID	(16)
+static void gmc_v7_0_init_compute_vmid(struct amdgpu_device *adev)
+{
+	int i;
+	uint32_t sh_mem_config;
+	uint32_t sh_mem_bases;
+
+	/*
+	 * Configure apertures:
+	 * LDS:         0x60000000'00000000 - 0x60000001'00000000 (4GB)
+	 * Scratch:     0x60000001'00000000 - 0x60000002'00000000 (4GB)
+	 * GPUVM:       0x60010000'00000000 - 0x60020000'00000000 (1TB)
+	*/
+	sh_mem_bases = DEFAULT_SH_MEM_BASES | (DEFAULT_SH_MEM_BASES << 16);
+	sh_mem_config = SH_MEM_ALIGNMENT_MODE_UNALIGNED <<
+			SH_MEM_CONFIG__ALIGNMENT_MODE__SHIFT;
+	sh_mem_config |= MTYPE_NONCACHED << SH_MEM_CONFIG__DEFAULT_MTYPE__SHIFT;
+	mutex_lock(&adev->srbm_mutex);
+	for (i = FIRST_COMPUTE_VMID; i < LAST_COMPUTE_VMID; i++) {
+		cik_srbm_select(adev, 0, 0, 0, i);
+		/* CP and shaders */
+		WREG32(mmSH_MEM_CONFIG, sh_mem_config);
+		WREG32(mmSH_MEM_APE1_BASE, 1);
+		WREG32(mmSH_MEM_APE1_LIMIT, 0);
+		WREG32(mmSH_MEM_BASES, sh_mem_bases);
+	}
+	cik_srbm_select(adev, 0, 0, 0, 0);
+	mutex_unlock(&adev->srbm_mutex);
+}
+
+/**
  * gfx_v7_0_gpu_init - setup the 3D engine
  *
  * @adev: amdgpu_device pointer
@@ -2229,6 +2269,8 @@ static void gfx_v7_0_gpu_init(struct amdgpu_device *adev)
 	}
 	cik_srbm_select(adev, 0, 0, 0, 0);
 	mutex_unlock(&adev->srbm_mutex);
+
+	gmc_v7_0_init_compute_vmid(adev);
 
 	WREG32(mmSX_DEBUG_1, 0x20);
 
@@ -2519,7 +2561,7 @@ static bool gfx_v7_0_ring_emit_semaphore(struct amdgpu_ring *ring,
  * sheduling on the ring.  This function schedules the IB
  * on the gfx ring for execution by the GPU.
  */
-static void gfx_v7_0_ring_emit_ib(struct amdgpu_ring *ring,
+static void gfx_v7_0_ring_emit_ib_gfx(struct amdgpu_ring *ring,
 				  struct amdgpu_ib *ib)
 {
 	bool need_ctx_switch = ring->current_ctx != ib->ctx;
@@ -2527,15 +2569,10 @@ static void gfx_v7_0_ring_emit_ib(struct amdgpu_ring *ring,
 	u32 next_rptr = ring->wptr + 5;
 
 	/* drop the CE preamble IB for the same context */
-	if ((ring->type == AMDGPU_RING_TYPE_GFX) &&
-	    (ib->flags & AMDGPU_IB_FLAG_PREAMBLE) &&
-	    !need_ctx_switch)
+	if ((ib->flags & AMDGPU_IB_FLAG_PREAMBLE) && !need_ctx_switch)
 		return;
 
-	if (ring->type == AMDGPU_RING_TYPE_COMPUTE)
-		control |= INDIRECT_BUFFER_VALID;
-
-	if (need_ctx_switch && ring->type == AMDGPU_RING_TYPE_GFX)
+	if (need_ctx_switch)
 		next_rptr += 2;
 
 	next_rptr += 4;
@@ -2546,7 +2583,7 @@ static void gfx_v7_0_ring_emit_ib(struct amdgpu_ring *ring,
 	amdgpu_ring_write(ring, next_rptr);
 
 	/* insert SWITCH_BUFFER packet before first IB in the ring frame */
-	if (need_ctx_switch && ring->type == AMDGPU_RING_TYPE_GFX) {
+	if (need_ctx_switch) {
 		amdgpu_ring_write(ring, PACKET3(PACKET3_SWITCH_BUFFER, 0));
 		amdgpu_ring_write(ring, 0);
 	}
@@ -2565,6 +2602,35 @@ static void gfx_v7_0_ring_emit_ib(struct amdgpu_ring *ring,
 			  (2 << 0) |
 #endif
 			  (ib->gpu_addr & 0xFFFFFFFC));
+	amdgpu_ring_write(ring, upper_32_bits(ib->gpu_addr) & 0xFFFF);
+	amdgpu_ring_write(ring, control);
+}
+
+static void gfx_v7_0_ring_emit_ib_compute(struct amdgpu_ring *ring,
+				  struct amdgpu_ib *ib)
+{
+	u32 header, control = 0;
+	u32 next_rptr = ring->wptr + 5;
+
+	control |= INDIRECT_BUFFER_VALID;
+	next_rptr += 4;
+	amdgpu_ring_write(ring, PACKET3(PACKET3_WRITE_DATA, 3));
+	amdgpu_ring_write(ring, WRITE_DATA_DST_SEL(5) | WR_CONFIRM);
+	amdgpu_ring_write(ring, ring->next_rptr_gpu_addr & 0xfffffffc);
+	amdgpu_ring_write(ring, upper_32_bits(ring->next_rptr_gpu_addr) & 0xffffffff);
+	amdgpu_ring_write(ring, next_rptr);
+
+	header = PACKET3(PACKET3_INDIRECT_BUFFER, 2);
+
+	control |= ib->length_dw |
+			   (ib->vm ? (ib->vm->ids[ring->idx].id << 24) : 0);
+
+	amdgpu_ring_write(ring, header);
+	amdgpu_ring_write(ring,
+#ifdef __BIG_ENDIAN
+					  (2 << 0) |
+#endif
+					  (ib->gpu_addr & 0xFFFFFFFC));
 	amdgpu_ring_write(ring, upper_32_bits(ib->gpu_addr) & 0xFFFF);
 	amdgpu_ring_write(ring, control);
 }
@@ -3014,6 +3080,8 @@ static int gfx_v7_0_cp_compute_load_microcode(struct amdgpu_device *adev)
 	mec_hdr = (const struct gfx_firmware_header_v1_0 *)adev->gfx.mec_fw->data;
 	amdgpu_ucode_print_gfx_hdr(&mec_hdr->header);
 	adev->gfx.mec_fw_version = le32_to_cpu(mec_hdr->header.ucode_version);
+	adev->gfx.mec_feature_version = le32_to_cpu(
+					mec_hdr->ucode_feature_version);
 
 	gfx_v7_0_cp_compute_enable(adev, false);
 
@@ -3036,6 +3104,8 @@ static int gfx_v7_0_cp_compute_load_microcode(struct amdgpu_device *adev)
 		mec2_hdr = (const struct gfx_firmware_header_v1_0 *)adev->gfx.mec2_fw->data;
 		amdgpu_ucode_print_gfx_hdr(&mec2_hdr->header);
 		adev->gfx.mec2_fw_version = le32_to_cpu(mec2_hdr->header.ucode_version);
+		adev->gfx.mec2_feature_version = le32_to_cpu(
+				mec2_hdr->ucode_feature_version);
 
 		/* MEC2 */
 		fw_data = (const __le32 *)
@@ -4000,6 +4070,8 @@ static int gfx_v7_0_rlc_resume(struct amdgpu_device *adev)
 	hdr = (const struct rlc_firmware_header_v1_0 *)adev->gfx.rlc_fw->data;
 	amdgpu_ucode_print_rlc_hdr(&hdr->header);
 	adev->gfx.rlc_fw_version = le32_to_cpu(hdr->header.ucode_version);
+	adev->gfx.rlc_feature_version = le32_to_cpu(
+					hdr->ucode_feature_version);
 
 	gfx_v7_0_rlc_stop(adev);
 
@@ -5056,7 +5128,7 @@ static void gfx_v7_0_print_status(void *handle)
 		dev_info(adev->dev, "  CP_HPD_EOP_CONTROL=0x%08X\n",
 			 RREG32(mmCP_HPD_EOP_CONTROL));
 
-		for (queue = 0; queue < 8; i++) {
+		for (queue = 0; queue < 8; queue++) {
 			cik_srbm_select(adev, me, pipe, queue, 0);
 			dev_info(adev->dev, "  queue: %d\n", queue);
 			dev_info(adev->dev, "  CP_PQ_WPTR_POLL_CNTL=0x%08X\n",
@@ -5513,7 +5585,7 @@ static const struct amdgpu_ring_funcs gfx_v7_0_ring_funcs_gfx = {
 	.get_wptr = gfx_v7_0_ring_get_wptr_gfx,
 	.set_wptr = gfx_v7_0_ring_set_wptr_gfx,
 	.parse_cs = NULL,
-	.emit_ib = gfx_v7_0_ring_emit_ib,
+	.emit_ib = gfx_v7_0_ring_emit_ib_gfx,
 	.emit_fence = gfx_v7_0_ring_emit_fence_gfx,
 	.emit_semaphore = gfx_v7_0_ring_emit_semaphore,
 	.emit_vm_flush = gfx_v7_0_ring_emit_vm_flush,
@@ -5529,7 +5601,7 @@ static const struct amdgpu_ring_funcs gfx_v7_0_ring_funcs_compute = {
 	.get_wptr = gfx_v7_0_ring_get_wptr_compute,
 	.set_wptr = gfx_v7_0_ring_set_wptr_compute,
 	.parse_cs = NULL,
-	.emit_ib = gfx_v7_0_ring_emit_ib,
+	.emit_ib = gfx_v7_0_ring_emit_ib_compute,
 	.emit_fence = gfx_v7_0_ring_emit_fence_compute,
 	.emit_semaphore = gfx_v7_0_ring_emit_semaphore,
 	.emit_vm_flush = gfx_v7_0_ring_emit_vm_flush,
